@@ -1,0 +1,111 @@
+# llama.cpp RWKV7-MoE
+
+A patch adding support for a bespoke architecture to [llama.cpp](https://github.com/ggml-org/llama.cpp):
+**dense RWKV7 time-mix + a DeepSeek-V3-style sparse MoE channel-mix** (always-on shared
+expert + top-k of N routed experts + aux-loss-free bias load balancing), built by
+sparse-upcycling a dense RWKV7 0.4B donor model. New arch string: `rwkv7moe`.
+
+Built for the [OpenMythos](#) project — a ~9.1B-capacity (blended active compute close to a
+1-1.5B dense model) RWKV7-MoE, trained via RWKV-PEFT, destined to run via `llama-server` on a
+Raspberry Pi and serve openwebui over its OpenAI-compatible API (bypassing ollama's vendored
+llama.cpp fork entirely, since it has no MoE-channel-mix support).
+
+## What's patched
+
+Dense RWKV7 time-mix is reused completely unchanged (`llm_build_rwkv7_base`). Channel-mix is
+replaced with llama.cpp's existing generic `build_moe_ffn` machinery — no new ggml ops needed,
+just a new architecture wiring together primitives that already exist for other MoE archs
+(Qwen2MoE, DeepSeek-V2/V3, etc.):
+
+- `src/llama-arch.h` / `src/llama-arch.cpp` — new `LLM_ARCH_RWKV7MOE` enum value, name
+  registration (`"rwkv7moe"`), marked recurrent (shares RWKV's token-shift/time-mix state).
+- `src/models/models.h` — `llama_model_rwkv7moe` class declaration.
+- `src/models/rwkv7moe.cpp` — the actual implementation: hparam/tensor loading, graph builder.
+- `src/llama-model.cpp` — factory dispatch + RoPE-type switch (RWKV uses none).
+
+No tensor-name or MoE-FFN-builder changes were needed — `build_moe_ffn`'s
+`LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT` gating mode is an exact match for this model's
+training-time routing (bias added to raw router logits for top-k *selection* only; mixing
+weights are softmax over just the selected logits, bias-free) — see the comments in
+`src/models/rwkv7moe.cpp` for the derivation against the reference PyTorch module
+(`RWKV_CMix_x070_MoE` in RWKV-PEFT's `ffn_moe.py`).
+
+## Converter
+
+`convert/convert_rwkv7moe_to_gguf.py` — standalone, does **not** go through
+`convert_hf_to_gguf.py`'s `ModelBase` registry (this isn't an AutoModel/HF-config checkpoint).
+Writes GGUF directly via `gguf.GGUFWriter`. Expects a single merged PyTorch state dict with
+RWKV-PEFT/BlinkDL-style key names (`blocks.{i}.att.*`, `blocks.{i}.ffn.{shared,routed,router,
+routing_bias}`, etc. — see the script's docstring for the full key list).
+
+Two bugs caught and fixed during validation (both would have hard-failed on a real checkpoint):
+
+1. **Layer-0 `time_mix_v1`/`v2` rank mismatch.** llama.cpp's loader (inherited from dense
+   RWKV7) allocates layer 0's `v1`/`v2` at the ICLR lora rank, but the training code allocates
+   them at the value-residual-mix rank for *every* layer including 0. Harmless in practice —
+   layer 0's forward pass never reads `v1`/`v2` (it takes the `v_first = v` branch) — so the
+   converter substitutes correctly-shaped zero tensors for layer 0 specifically.
+2. **`exp_probs_b` tensor name has no `ffn_` prefix** in llama.cpp's naming convention
+   (`blk.%d.exp_probs_b`, not `blk.%d.ffn_exp_probs_b` — the one inconsistent one of the
+   MoE tensor set).
+
+## Status
+
+Validated against a synthetic checkpoint (`convert/make_tiny_test_ckpt.py`, deliberately built
+with mismatched lora ranks per layer to exercise bug #1 above):
+
+- [x] Compiles clean, zero warnings on the new file.
+- [x] `llama-cli`: loads, runs multi-token generation (64+ tokens), recurrent state stable.
+- [x] `llama-quantize` → Q4_K_M: per-expert 3D tensors (`ffn_up_exps`/`ffn_down_exps`)
+      quantize correctly; quantized model loads and generates.
+- [x] `llama-server`: full `/v1/chat/completions` HTTP round-trip — the actual path openwebui
+      will hit.
+- [x] Chat template: wired to llama.cpp's own `models/templates/llama-cpp-rwkv-world.jinja`
+      (`System:`/`User:`/`Assistant:` + `\n\n`, which happens to already match this project's
+      SFT data format) plus EOT token 261 (`\n\n`).
+
+**Not yet done:** validated against a real trained checkpoint (SFT hasn't run yet — this was
+built ahead of that, so it's ready the moment a merged checkpoint exists). No sparse-dispatch
+performance benchmarking against the real model size yet.
+
+## Building
+
+```sh
+cmake -B build -DLLAMA_CURL=OFF
+cmake --build build --target llama-cli llama-server llama-quantize -j$(nproc)
+```
+
+## Converting a checkpoint
+
+```sh
+python3 convert/convert_rwkv7moe_to_gguf.py \
+  --checkpoint merged_sft_model.pth \
+  --vocab-dir /path/to/dir/containing/rwkv_vocab_v20230424.txt \
+  --outfile rwkv7moe.gguf \
+  --n-routed 43 --top-k 2 --outtype f16
+```
+
+Then optionally quantize:
+
+```sh
+./build/bin/llama-quantize rwkv7moe.gguf rwkv7moe-q4km.gguf Q4_K_M
+```
+
+And serve:
+
+```sh
+./build/bin/llama-server -m rwkv7moe-q4km.gguf --port 8080
+```
+
+## Applying this patch
+
+```sh
+git clone https://github.com/ggml-org/llama.cpp.git
+cd llama.cpp
+git checkout 889f2ec   # see UPSTREAM_BASE.txt for the exact base commit this was built against
+git apply /path/to/llama.cpp-mod/0001-rwkv7moe-arch-registration.patch
+cp /path/to/llama.cpp-mod/src/models/rwkv7moe.cpp src/models/rwkv7moe.cpp
+```
+
+Then build as described above. `src/CMakeLists.txt` globs `models/*.cpp` already, so no
+CMake changes are needed for the new file to be picked up.

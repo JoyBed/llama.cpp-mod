@@ -1,0 +1,1 @@
+upstream base commit: 889f2ec96deacbc2d8a9a67dbe181eaa43a2fb3b quant : allow quantization for LFM3-Audio codec decoder (#31386)
