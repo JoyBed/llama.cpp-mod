@@ -63,6 +63,32 @@ Two bugs caught and fixed during validation (both would have hard-failed on a re
    first real-checkpoint export's `llama-perplexity` cross-check crashed with that exact
    message — the original tiny checkpoint's small tensors happened to never trigger the
    specific code path that exposes it.
+4. **Global `layer_norm_eps` was 64x too large, silently corrupting every regular LayerNorm
+   in the network.** Training (`rwkvt/rwkv7/block.py`) defines `ln0`/`ln1`/`ln2`/`ln_out` as
+   plain `nn.LayerNorm(n_embd)` with no eps override — PyTorch default `1e-5`. A *different*,
+   deliberately-flagged quirk (`rwkvt/rwkv7/att.py`: `eps=(1e-5)*(head_size_divisor**2)`,
+   commented `"!!! notice eps value !!!"`) applies only to `ln_x`, the GroupNorm inside
+   attention. The converter computed that `6.4e-4` ln_x-specific value and wrote it as the
+   GGUF's *global* `layer_norm_eps`, which `build_norm()` applies to every other LayerNorm
+   call (~100 across 24 layers) — while llama.cpp's `ln_x` GroupNorm is hardcoded separately
+   as `64e-5f` in `rwkv7-base.cpp` and never reads this GGUF key at all. Net effect: the one
+   norm meant to get the scaled value never used this setting, and every norm that should
+   have gotten plain `1e-5` got 64x too much instead. The model loaded and ran with no crash
+   and no shape mismatch — the architecture, quantization, and crash-path tests all passed —
+   but every layer's normalization was cumulatively wrong.
+
+   **Caught by the first real numeric cross-check against the trained checkpoint** (three-way
+   perplexity: PyTorch merged model vs. f16 GGUF vs. Q4_K_M GGUF, all on the same eval text).
+   Before the fix: PyTorch ppl=15.95, f16-GGUF ppl=15702.79, Q4_K_M-GGUF ppl=29121.87 — both
+   GGUF variants broken roughly equally badly, which is what pointed at a conversion-time bug
+   rather than a quantization-specific one (quantization noise alone doesn't explain a
+   1000x perplexity blowup that's already present at f16). After the fix: PyTorch ppl=15.95,
+   f16-GGUF ppl=13.13, Q4_K_M-GGUF ppl=13.85 — all in the same ballpark (spread is normal
+   variance on a 226-token sample). Confirmed qualitatively too: greedy completion of "The
+   capital of France is" went from degenerate repetition (`or or or or...`) to the correct
+   `The capital of France is Paris.`
+   Fix: `layer_norm_eps = 1e-5` (both converter copies), leaving `ln_x`'s hardcoded C++ value
+   untouched since it was already correct and independent of this metadata key.
 
 ## Status
 
@@ -70,7 +96,8 @@ Validated against both a small synthetic checkpoint (`convert/make_tiny_test_ckp
 deliberately built with mismatched lora ranks per layer to exercise bug #1 above) and a
 real-dimensioned synthetic checkpoint (same generator, parameterized to the real model's
 n_embd=1024, head_size=64, dim_ffn=4096, n_routed=43 — needed to catch bug #3, which the tiny
-checkpoint's small tensor sizes never triggered):
+checkpoint's small tensor sizes never triggered). **Also validated end-to-end against the
+actual trained checkpoint** (bug #4 above) and on real Raspberry Pi hardware:
 
 - [x] Compiles clean, zero warnings on the new file.
 - [x] `llama-cli`: loads, runs multi-token generation (64+ tokens), recurrent state stable.
@@ -83,11 +110,10 @@ checkpoint's small tensor sizes never triggered):
 - [x] Chat template: wired to llama.cpp's own `models/templates/llama-cpp-rwkv-world.jinja`
       (`System:`/`User:`/`Assistant:` + `\n\n`, which happens to already match this project's
       SFT data format) plus EOT token 261 (`\n\n`).
-
-**Not yet done:** end-to-end run against the actual trained checkpoint's numbers (in
-progress — Kaggle CPU kernel exports + quantizes the real merged distill-pretrain checkpoint
-and cross-checks perplexity against the PyTorch reference). Real-hardware speed benchmark on
-the Raspberry Pi target not yet run.
+- [x] Numeric correctness against the real trained (distill-pretrain) checkpoint: perplexity
+      within normal variance of the PyTorch reference, both f16 and Q4_K_M (see bug #4).
+- [x] Real-hardware speed benchmark, Raspberry Pi (4 threads, Q4_K_M, 9.11B total / sparse
+      MoE-active params, 5.35 GiB on disk): prompt processing 16.47 t/s, generation 6.2 t/s.
 
 ## Building
 

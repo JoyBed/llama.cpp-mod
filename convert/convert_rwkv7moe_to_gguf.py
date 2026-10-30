@@ -109,7 +109,15 @@ def main():
     n_routed = args.n_routed
     top_k = args.top_k
     head_size = args.head_size
-    layer_norm_eps = 1e-5 * (args.head_size_divisor ** 2)
+    # ln0/ln1/ln2/ln_out (rwkvt/rwkv7/block.py) are plain nn.LayerNorm(n_embd) with NO eps
+    # override in training, i.e. PyTorch's default 1e-5. The scaled eps (1e-5 * head_size_
+    # divisor**2 = 6.4e-4) is a DIFFERENT, deliberately-flagged quirk that applies ONLY to
+    # ln_x, the GroupNorm inside attention (rwkvt/rwkv7/att.py: "!!! notice eps value !!!").
+    # llama.cpp hardcodes that ln_x eps separately as 64e-5f in rwkv7-base.cpp and never reads
+    # it from GGUF metadata -- so writing the scaled value here as the GLOBAL layer_norm_eps
+    # silently corrupts every *other* LayerNorm in the network (ln0/ln1/ln2/ln_out, ~100 calls
+    # across all layers) with a 64x-too-large epsilon instead.
+    layer_norm_eps = 1e-5
 
     print(f"n_embd={n_embd} n_layer={n_layer} dim_ffn={dim_ffn} vocab={vocab_size} "
           f"n_routed={n_routed} top_k={top_k} head_size={head_size}")
