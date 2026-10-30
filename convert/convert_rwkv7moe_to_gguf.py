@@ -127,9 +127,11 @@ def main():
                   "f16": gguf.LlamaFileType.MOSTLY_F16,
                   "bf16": gguf.LlamaFileType.MOSTLY_BF16}[args.outtype]
 
-    def to_np(t: torch.Tensor) -> np.ndarray:
+    def to_np(t: torch.Tensor, force_f32: bool = False) -> np.ndarray:
         t = t.detach()
-        if args.outtype == "bf16":
+        if force_f32 or args.outtype == "bf16":
+            # bf16 output type is handled by gguf.GGUFWriter's raw_dtype path elsewhere; here
+            # we just avoid truncating precision, same as upstream's _tensor_requires_f32.
             return t.to(torch.float32).numpy()
         if args.outtype == "f16":
             return t.to(torch.float16).numpy().astype(np.float16)
@@ -180,8 +182,20 @@ def main():
         print(f"warning: chat template not found at {template_path}, skipping add_chat_template")
 
     # ---- tensors ----
-    def add(name: str, t: torch.Tensor):
-        writer.add_tensor(name, to_np(t))
+    # Any 1-D tensor (biases, lerp/mix vectors, per-channel scalars), any "_norm" weight/bias,
+    # and a short explicit list of 2-D+ tensors that feed a ggml_mul (not ggml_mul_mat) --
+    # TIME_MIX_W1/W2 (decay lora pair), TIME_MIX_LERP_FUSED, FFN_GATE_INP (router) -- must stay
+    # F32 regardless of --outtype. This mirrors upstream convert_hf_to_gguf.py's
+    # ModelBase._tensor_requires_f32() exactly. Skipping this (as an earlier version of this
+    # script did) produces a GGUF that loads fine but crashes at first forward pass with
+    # ggml's binary-ops dispatcher aborting on "unsupported types: dst: f32, src0: f32,
+    # src1: f16" -- ggml_mul's CPU kernel only implements the (f16, f32) operand order, not
+    # (f32, f16), and our (and upstream's) ggml_mul calls always put the f32 activation first
+    # and the weight tensor second, so any of these ending up in a lower-precision dtype than
+    # f32 breaks that specific op.
+    def add(name: str, t: torch.Tensor, force_f32: bool = False):
+        force_f32 = force_f32 or t.dim() <= 1 or name.endswith("_norm.weight") or name.endswith("_norm.bias")
+        writer.add_tensor(name, to_np(t, force_f32=force_f32))
 
     add("token_embd.weight", sd["emb.weight"])
 
@@ -213,8 +227,8 @@ def main():
         # before writing -- exactly the same transpose conversion/rwkv.py applies to
         # the (numerically equivalent, differently-sourced) fla-hub checkpoints.
         add(blk + "time_mix_w0.weight", sd[a + "w0"].reshape(-1))
-        add(blk + "time_mix_w1.weight", sd[a + "w1"].transpose(0, 1))
-        add(blk + "time_mix_w2.weight", sd[a + "w2"].transpose(0, 1))
+        add(blk + "time_mix_w1.weight", sd[a + "w1"].transpose(0, 1), force_f32=True)
+        add(blk + "time_mix_w2.weight", sd[a + "w2"].transpose(0, 1), force_f32=True)
 
         add(blk + "time_mix_a0.weight", sd[a + "a0"].reshape(-1))
         add(blk + "time_mix_a1.weight", sd[a + "a1"].transpose(0, 1))
@@ -247,7 +261,7 @@ def main():
         # time_mix_lerp_fused: stack [x_r, x_w, x_k, x_v, x_a, x_g] -> (6, 1, 1, n_embd)
         lerp = torch.stack([sd[a + f"x_{c}"].reshape(-1) for c in ("r", "w", "k", "v", "a", "g")], dim=0)
         lerp = lerp.reshape(6, 1, 1, n_embd)
-        add(blk + "time_mix_lerp_fused.weight", lerp)
+        add(blk + "time_mix_lerp_fused.weight", lerp, force_f32=True)
 
         add(blk + "time_mix_k_k.weight", sd[a + "k_k"].reshape(-1))
         add(blk + "time_mix_k_a.weight", sd[a + "k_a"].reshape(-1))
@@ -267,7 +281,7 @@ def main():
         # router.weight is a plain nn.Linear(n_embd, n_routed) weight -- shape
         # (n_routed, n_embd), same (out, in) layout as every other dense weight here,
         # so no manual transpose needed (GGUFWriter's automatic shape reversal handles it).
-        add(blk + "ffn_gate_inp.weight", sd[f + "router.weight"])
+        add(blk + "ffn_gate_inp.weight", sd[f + "router.weight"], force_f32=True)
         add(blk + "exp_probs_b.bias", sd[f + "routing_bias"])
 
         up_exps = torch.stack([sd[f + f"routed_key.{e}.weight"] for e in range(n_routed)], dim=0)     # [n_routed, dim_ffn, n_embd]

@@ -48,11 +48,29 @@ Two bugs caught and fixed during validation (both would have hard-failed on a re
 2. **`exp_probs_b` tensor name has no `ffn_` prefix** in llama.cpp's naming convention
    (`blk.%d.exp_probs_b`, not `blk.%d.ffn_exp_probs_b` — the one inconsistent one of the
    MoE tensor set).
+3. **Blanket f16 cast crashes the very first forward pass on a real-dimensioned model.**
+   An earlier version of the converter cast every tensor to the target dtype uniformly. This
+   loads fine and even runs on a *tiny* synthetic checkpoint, but aborts on anything real-sized
+   with `ggml_abort: unsupported types: dst: f32, src0: f32, src1: f16` inside
+   `ggml_compute_forward_mul`. Root cause: ggml's CPU binary-ops dispatcher only implements
+   `ggml_mul` for the `(f16, f32)` operand order, never `(f32, f16)` — and every `ggml_mul`
+   call here (and in dense RWKV7, verbatim-reused) puts the f32 activation first and the
+   weight tensor second. Fix: force F32 for any 1-D tensor, any `_norm.weight`/`_norm.bias`,
+   and the specific 2-D+ tensors that feed a `ggml_mul` rather than a `ggml_mul_mat`
+   (`time_mix_w1`/`w2`, `time_mix_lerp_fused`, `ffn_gate_inp`) — this exactly mirrors
+   upstream `convert_hf_to_gguf.py`'s `ModelBase._tensor_requires_f32()`. Caught by
+   reproducing on a *real-dimensioned* (not the original tiny) synthetic checkpoint after the
+   first real-checkpoint export's `llama-perplexity` cross-check crashed with that exact
+   message — the original tiny checkpoint's small tensors happened to never trigger the
+   specific code path that exposes it.
 
 ## Status
 
-Validated against a synthetic checkpoint (`convert/make_tiny_test_ckpt.py`, deliberately built
-with mismatched lora ranks per layer to exercise bug #1 above):
+Validated against both a small synthetic checkpoint (`convert/make_tiny_test_ckpt.py`,
+deliberately built with mismatched lora ranks per layer to exercise bug #1 above) and a
+real-dimensioned synthetic checkpoint (same generator, parameterized to the real model's
+n_embd=1024, head_size=64, dim_ffn=4096, n_routed=43 — needed to catch bug #3, which the tiny
+checkpoint's small tensor sizes never triggered):
 
 - [x] Compiles clean, zero warnings on the new file.
 - [x] `llama-cli`: loads, runs multi-token generation (64+ tokens), recurrent state stable.
@@ -60,13 +78,16 @@ with mismatched lora ranks per layer to exercise bug #1 above):
       quantize correctly; quantized model loads and generates.
 - [x] `llama-server`: full `/v1/chat/completions` HTTP round-trip — the actual path openwebui
       will hit.
+- [x] `llama-perplexity`: real multi-token forward pass (batched prefill, not just
+      single-token decode steps) on both f16 and Q4_K_M, at real-model dimensions.
 - [x] Chat template: wired to llama.cpp's own `models/templates/llama-cpp-rwkv-world.jinja`
       (`System:`/`User:`/`Assistant:` + `\n\n`, which happens to already match this project's
       SFT data format) plus EOT token 261 (`\n\n`).
 
-**Not yet done:** validated against a real trained checkpoint (SFT hasn't run yet — this was
-built ahead of that, so it's ready the moment a merged checkpoint exists). No sparse-dispatch
-performance benchmarking against the real model size yet.
+**Not yet done:** end-to-end run against the actual trained checkpoint's numbers (in
+progress — Kaggle CPU kernel exports + quantizes the real merged distill-pretrain checkpoint
+and cross-checks perplexity against the PyTorch reference). Real-hardware speed benchmark on
+the Raspberry Pi target not yet run.
 
 ## Building
 
