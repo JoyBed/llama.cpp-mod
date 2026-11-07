@@ -1,0 +1,70 @@
+name: Build RWKV7-MoE llama.xcframework
+
+# Produces llama.xcframework (ios-device + ios-sim slices) with the rwkv7moe
+# arch patch baked in. This is the real fix for the fact that this repo is a
+# patch, not a full buildable fork: CI clones upstream llama.cpp at the pinned
+# base commit, applies the patch (same recipe as the README's "Applying this
+# patch" section), then runs upstream's own build-xcframework.sh.
+#
+# Output: an artifact you download and drag straight into Xcode as a local
+# binary framework (Target -> General -> Frameworks, Libraries -> Add Files).
+# No SPM remote-package step needed, no hosting/release/checksum juggling.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "0001-rwkv7moe-arch-registration.patch"
+      - "src/models/rwkv7moe.cpp"
+      - "UPSTREAM_BASE.txt"
+      - ".github/workflows/build-xcframework.yml"
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout patch repo
+        uses: actions/checkout@v4
+        with:
+          path: patch-repo
+
+      - name: Read pinned upstream base commit
+        id: base
+        run: |
+          sha=$(grep -oE '^upstream base commit: [0-9a-f]+' patch-repo/UPSTREAM_BASE.txt | awk '{print $4}')
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "Pinned upstream base: $sha"
+
+      - name: Checkout upstream llama.cpp at pinned commit
+        uses: actions/checkout@v4
+        with:
+          repository: ggml-org/llama.cpp
+          ref: ${{ steps.base.outputs.sha }}
+          path: llama.cpp
+
+      - name: Apply rwkv7moe patch
+        run: |
+          cd llama.cpp
+          git apply ../patch-repo/0001-rwkv7moe-arch-registration.patch
+          cp ../patch-repo/src/models/rwkv7moe.cpp src/models/rwkv7moe.cpp
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app
+
+      - name: Build xcframework (iOS device + simulator only, to keep CI time sane)
+        run: |
+          cd llama.cpp
+          chmod +x build-xcframework.sh
+          ./build-xcframework.sh ios-device ios-sim
+
+      - name: Locate and zip the built xcframework
+        run: |
+          cd llama.cpp
+          find . -maxdepth 2 -iname "llama.xcframework" -exec echo "found: {}" \;
+          xcf=$(find . -maxdepth 2 -iname "llama.xcframework")
+          zip -r "$GITHUB_WORKSPACE/llama-rwkv7moe.xcframework.zip" "$xcf"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: llama-rwkv7moe-xcframework
+          path: llama-rwkv7moe.xcframework.zip
